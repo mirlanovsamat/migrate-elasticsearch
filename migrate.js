@@ -2,7 +2,7 @@ const { Client } = require('@elastic/elasticsearch');
 const { createClient } = require('redis');
 
 // Подключение к Elasticsearch с Basic Auth
-const ES_CLIENT = new Client({ 
+const ES_CLIENT = new Client({
   node: 'http://217.77.6.58:9200',
   auth: {
     username: 'elastic',
@@ -435,7 +435,7 @@ async function checkMemory() {
     const memoryInfo = await REDIS_CLIENT.info('memory');
     const usedMemoryMatch = memoryInfo.match(/used_memory:(\d+)/);
     const usedMemory = usedMemoryMatch ? parseInt(usedMemoryMatch[1]) : 0;
-    
+
     console.log(`💾 Текущее использование памяти: ${(usedMemory / 1024 / 1024).toFixed(2)} MB`);
     return usedMemory;
   } catch (error) {
@@ -444,21 +444,55 @@ async function checkMemory() {
   }
 }
 
-// Функция scroll для ограниченного количества документов (100,000)
-async function scrollLimitedDocuments(limit = 5000) {
-  console.log(`📖 Используем Scroll API для чтения ${limit.toLocaleString()} документов...`);
-  
-  let allDocuments = [];
+// Функция для обработки и сохранения батча документов
+async function processBatch(batch, migratedCount, totalDocs, startTime) {
+  const pipeline = REDIS_CLIENT.multi();
+
+  for (const doc of batch) {
+    const redisKey = `truck:${doc._id}`;
+    const normalizedDoc = normalizeDocument(doc._source);
+    pipeline.json.set(redisKey, '$', normalizedDoc);
+  }
+
+  await pipeline.exec();
+
+  const newCount = migratedCount + batch.length;
+
+  // Прогресс каждые 10k документов
+  if (newCount % 10000 === 0) {
+    const progress = ((newCount / totalDocs) * 100).toFixed(1);
+    const elapsed = ((Date.now() - startTime) / 1000 / 60).toFixed(1);
+    const docsPerMinute = Math.round(newCount / (elapsed || 1));
+
+    console.log(`💾 Сохранено: ${newCount.toLocaleString()}/${totalDocs.toLocaleString()} (${progress}%)`);
+    console.log(`   ⏱️  Время: ${elapsed} мин | 🚀 Скорость: ${docsPerMinute.toLocaleString()} док/мин`);
+
+    // Проверяем память каждые 20k документов
+    if (newCount % 20000 === 0) {
+      await checkMemory();
+    }
+  }
+
+  return newCount;
+}
+
+// Потоковая обработка документов без накопления в памяти
+async function scrollAndProcessStreaming(totalDocs, startTime) {
+  console.log(`📖 Используем потоковый Scroll API для обработки всех документов...`);
+
   let scrollId = null;
   const scrollTimeout = '2m';
   const batchSize = 1000;
+  let processedCount = 0;
+  let consecutiveErrors = 0;
+  const maxErrors = 5;
 
   try {
     // Начальный запрос scroll
     let response = await ES_CLIENT.search({
       index: 'trucking_data',
       scroll: scrollTimeout,
-      size: Math.min(batchSize, limit),
+      size: batchSize,
       body: {
         query: { match_all: {} },
         _source: true
@@ -466,48 +500,70 @@ async function scrollLimitedDocuments(limit = 5000) {
     });
 
     scrollId = response._scroll_id;
-    
-    // Обрабатываем первую партию
-    allDocuments = allDocuments.concat(response.hits.hits);
-    console.log(`📦 Загружено: ${response.hits.hits.length} документов`);
 
-    // Продолжаем scroll пока есть документы и не достигли лимита
-    while (response.hits.hits.length > 0 && allDocuments.length < limit) {
-      response = await ES_CLIENT.scroll({
-        scroll_id: scrollId,
-        scroll: scrollTimeout
-      });
-
-      scrollId = response._scroll_id;
-      
+    // Обрабатываем документы потоково
+    while (response.hits.hits.length > 0) {
+      // Обрабатываем текущую партию
       if (response.hits.hits.length > 0) {
-        // Добавляем только до лимита
-        const remaining = limit - allDocuments.length;
-        const docsToAdd = response.hits.hits.slice(0, remaining);
-        allDocuments = allDocuments.concat(docsToAdd);
-        
-        // Прогресс каждые 10k документов
-        if (allDocuments.length % 10000 === 0) {
-          console.log(`📦 Загружено: ${allDocuments.length.toLocaleString()}/${limit.toLocaleString()} документов`);
+        try {
+          processedCount = await processBatch(response.hits.hits, processedCount, totalDocs, startTime);
+          consecutiveErrors = 0;
+
+          if (processedCount % 10000 === 0) {
+            console.log(`📦 Обработано: ${processedCount.toLocaleString()}/${totalDocs.toLocaleString()} документов`);
+          }
+
+          // Небольшая пауза чтобы не перегружать системы
+          if (processedCount % 5000 === 0) {
+            await new Promise(resolve => setTimeout(resolve, 50));
+          }
+        } catch (batchError) {
+          consecutiveErrors++;
+          console.error(`❌ Ошибка в батче:`, batchError.message);
+
+          if (consecutiveErrors >= maxErrors) {
+            console.error('💥 Слишком много ошибок подряд, останавливаем миграцию');
+            throw new Error('Too many consecutive errors');
+          }
+
+          await new Promise(resolve => setTimeout(resolve, 2000));
         }
-        
-        // Если достигли лимита - выходим
-        if (allDocuments.length >= limit) {
-          console.log(`🎯 Достигнут лимит в ${limit.toLocaleString()} документов`);
-          break;
+      }
+
+      // Получаем следующую партию документов
+      try {
+        response = await ES_CLIENT.scroll({
+          scroll_id: scrollId,
+          scroll: scrollTimeout
+        });
+
+        scrollId = response._scroll_id;
+      } catch (scrollError) {
+        console.error(`❌ Ошибка при scroll:`, scrollError.message);
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        // Продолжаем попытки - повторяем последний запрос
+        try {
+          response = await ES_CLIENT.scroll({
+            scroll_id: scrollId,
+            scroll: scrollTimeout
+          });
+          scrollId = response._scroll_id;
+        } catch (retryError) {
+          console.error(`❌ Повторная попытка scroll не удалась:`, retryError.message);
+          throw retryError;
         }
       }
     }
 
-    console.log(`✅ Всего загружено документов: ${allDocuments.length.toLocaleString()}`);
-    
+    console.log(`✅ Всего обработано документов: ${processedCount.toLocaleString()}`);
+
     // Очищаем scroll
     if (scrollId) {
       await ES_CLIENT.clearScroll({ scroll_id: scrollId });
     }
-    
-    return allDocuments;
-    
+
+    return processedCount;
+
   } catch (error) {
     // Всегда очищаем scroll при ошибке
     if (scrollId) {
@@ -521,185 +577,70 @@ async function scrollLimitedDocuments(limit = 5000) {
   }
 }
 
-// Альтернативная версия scroll с лимитом
-async function scrollLimitedDocumentsAlternative(limit = 5000) {
-  console.log(`📖 Используем альтернативный Scroll API для ${limit.toLocaleString()} документов...`);
-  
-  const allDocuments = [];
-  let response = await ES_CLIENT.search({
-    index: 'trucking_data',
-    scroll: '2m',
-    size: 1000,
-    body: {
-      query: { match_all: {} },
-      _source: true
-    }
-  });
+// Оптимизированная потоковая миграция без накопления в памяти
+async function migrateLimitedData() {
+  const startTime = Date.now();
+  let initialMemory = 0;
 
-  while (response.hits.hits.length > 0 && allDocuments.length < limit) {
-    // Добавляем только до лимита
-    const remaining = limit - allDocuments.length;
-    const docsToAdd = response.hits.hits.slice(0, remaining);
-    allDocuments.push(...docsToAdd);
-    
-    if (allDocuments.length % 10000 === 0) {
-      console.log(`📦 Загружено: ${allDocuments.length.toLocaleString()}/${limit.toLocaleString()} документов`);
-    }
-    
-    // Если достигли лимита - выходим
-    if (allDocuments.length >= limit) {
-      console.log(`🎯 Достигнут лимит в ${limit.toLocaleString()} документов`);
-      break;
-    }
-    
-    response = await ES_CLIENT.scroll({
-      scroll_id: response._scroll_id,
-      scroll: '2m'
-    });
-  }
-
-  // Очищаем scroll
-  await ES_CLIENT.clearScroll({ scroll_id: response._scroll_id });
-  
-  console.log(`✅ Всего загружено документов: ${allDocuments.length.toLocaleString()}`);
-  return allDocuments;
-}
-
-// Оптимизированная миграция с лимитом 100,000 записей
-async function migrateLimitedData(limit = 5000) {
   try {
-    console.log(`🔄 Начинаем миграцию ${limit.toLocaleString()} записей...`);
-    
+    console.log(`🔄 Начинаем потоковую миграцию...`);
+
     // Проверяем общее количество документов
     const countResponse = await ES_CLIENT.count({ index: 'trucking_data' });
-    limit = countResponse.count;
     const totalDocs = countResponse.count;
     console.log(`📊 Всего документов в индексе: ${totalDocs.toLocaleString()}`);
-    console.log(`🎯 Будет мигрировано: ${Math.min(limit, totalDocs).toLocaleString()}`);
-    
-    const startTime = Date.now();
-    const initialMemory = await checkMemory();
+    console.log(`🎯 Будет мигрировано: ${totalDocs.toLocaleString()}`);
 
-    let allDocuments;
-    try {
-      // Пробуем основной метод scroll с лимитом
-      allDocuments = await scrollLimitedDocuments(limit);
-    } catch (scrollError) {
-      console.log('⚠️  Основной scroll не сработал, пробуем альтернативный...');
-      allDocuments = await scrollLimitedDocumentsAlternative(limit);
-    }
+    initialMemory = await checkMemory();
+    console.log(`💡 Используем потоковую обработку - документы не накапливаются в памяти`);
 
-    console.log(`⏳ Начинаем сохранение ${allDocuments.length.toLocaleString()} документов в Redis...`);
-    
-    let migratedCount = 0;
-    const batchSize = 1000;
-    let consecutiveErrors = 0;
-    const maxErrors = 5;
-
-    // Сохраняем документа батчами
-    for (let i = 0; i < allDocuments.length; i += batchSize) {
-      try {
-        const batch = allDocuments.slice(i, i + batchSize);
-        
-        // Используем pipeline для ускорения
-        const pipeline = REDIS_CLIENT.multi();
-        
-        for (const doc of batch) {
-          const redisKey = `truck:${doc._id}`;
-          const normalizedDoc = normalizeDocument(doc._source);
-          pipeline.json.set(redisKey, '$', normalizedDoc);
-        }
-        
-        await pipeline.exec();
-        migratedCount += batch.length;
-        
-        // Прогресс каждые 10k документов
-        if (migratedCount % 10000 === 0) {
-          const progress = ((migratedCount / allDocuments.length) * 100).toFixed(1);
-          const elapsed = ((Date.now() - startTime) / 1000 / 60).toFixed(1);
-          const docsPerMinute = Math.round(migratedCount / (elapsed || 1));
-          
-          console.log(`💾 Сохранено: ${migratedCount.toLocaleString()}/${allDocuments.length.toLocaleString()} (${progress}%)`);
-          console.log(`   ⏱️  Время: ${elapsed} мин | 🚀 Скорость: ${docsPerMinute.toLocaleString()} док/мин`);
-          
-          // Проверяем память каждые 20k документов
-          if (migratedCount % 20000 === 0) {
-            await checkMemory();
-          }
-        }
-        
-        consecutiveErrors = 0; // Сбрасываем счетчик ошибок
-        
-        // Небольшая пауза чтобы не перегружать системы
-        if (migratedCount % 5000 === 0) {
-          await new Promise(resolve => setTimeout(resolve, 50));
-        }
-        
-      } catch (batchError) {
-        consecutiveErrors++;
-        console.error(`❌ Ошибка в батче ${i}-${i + batchSize}:`, batchError.message);
-        
-        if (consecutiveErrors >= maxErrors) {
-          console.error('💥 Слишком много ошибок подряд, останавливаем миграцию');
-          break;
-        }
-        
-        // Пауза перед повторной попыткой
-        await new Promise(resolve => setTimeout(resolve, 2000));
-      }
-    }
+    // Используем потоковую обработку - сразу сохраняем в Redis
+    const migratedCount = await scrollAndProcessStreaming(totalDocs, startTime);
 
     const endTime = Date.now();
     const totalTime = (endTime - startTime) / 1000 / 60;
     const docsPerMinute = Math.round(migratedCount / (totalTime || 1));
-    
+
     console.log('\n🎉 МИГРАЦИЯ ЗАВЕРШЕНА!');
     console.log(`📈 Результаты:`);
     console.log(`   - Мигрировано документов: ${migratedCount.toLocaleString()}`);
     console.log(`   - Общее время: ${totalTime.toFixed(1)} минут`);
     console.log(`   - Скорость: ${docsPerMinute.toLocaleString()} док/мин`);
-    console.log(`   - Успешность: ${((migratedCount / allDocuments.length) * 100).toFixed(1)}%`);
-    
+    console.log(`   - Успешность: ${((migratedCount / totalDocs) * 100).toFixed(1)}%`);
+
     // Финальная проверка памяти
     const finalMemory = await checkMemory();
     if (initialMemory > 0 && finalMemory > 0) {
       const memoryUsed = finalMemory - initialMemory;
-      const avgPerDoc = Math.round(memoryUsed / migratedCount);
-      console.log(`   - Память использовано: ${(memoryUsed / 1024 / 1024).toFixed(2)} MB`);
-      console.log(`   - Средний размер документа: ${avgPerDoc} bytes`);
-      
-      // Прогноз для полного набора
-      const forecastFull = (avgPerDoc * totalDocs) / 1024 / 1024;
-      console.log(`   - Прогноз для всех ${totalDocs.toLocaleString()} документов: ~${forecastFull.toFixed(2)} MB`);
+      console.log(`   - Память Redis использовано: ${(memoryUsed / 1024 / 1024).toFixed(2)} MB`);
     }
-    
+
   } catch (error) {
     console.error('💥 Критическая ошибка миграции:', error);
+    throw error;
   }
 }
 
 // Основная функция
 async function main() {
   try {
-    const MIGRATION_LIMIT = 10000; // ← ИЗМЕНИТЕ ЗДЕСЬ если нужно другое количество
-    
-    console.log('🚀 ЗАПУСК ОГРАНИЧЕННОЙ МИГРАЦИИ');
+    console.log('🚀 ЗАПУСК ПОТОКОВОЙ МИГРАЦИИ');
     console.log('📍 Источник: http://217.77.6.58:9200/trucking_data');
-    console.log('🎯 Назначение: Redis Stack localhost:6379');
-    console.log(`📏 Лимит: ${MIGRATION_LIMIT.toLocaleString()} записей`);
-    console.log('=' .repeat(60));
-    
+    console.log('🎯 Назначение: Redis Stack');
+    console.log('💡 Режим: Потоковая обработка (без накопления в памяти)');
+    console.log('='.repeat(60));
+
     // Проверяем подключение к Redis
     await REDIS_CLIENT.connect();
     console.log('✅ Подключение к Redis установлено');
     await ensureIndex();
-    
-    // Запускаем ограниченную миграцию
-    await migrateLimitedData(MIGRATION_LIMIT);
-    
-    console.log('=' .repeat(60));
+
+    // Запускаем потоковую миграцию всех данных
+    await migrateLimitedData();
+
+    console.log('='.repeat(60));
     console.log('✅ МИГРАЦИЯ ЗАПИСЕЙ ЗАВЕРШЕНА!');
-    
+
   } catch (error) {
     console.error('💥 Критическая ошибка:', error);
   } finally {

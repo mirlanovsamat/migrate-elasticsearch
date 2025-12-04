@@ -4,7 +4,9 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "migrate": "node migrate.js",
+    "migrate:max-memory": "node --max-old-space-size=4096 migrate.js"
   },
   "keywords": [],
   "author": "",
